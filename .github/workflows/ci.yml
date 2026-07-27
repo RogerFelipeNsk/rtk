@@ -64,6 +64,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all
 
+      - name: "Smoke: rtk hook kiro (cross-platform)"
+        shell: bash
+        run: |
+          cargo build --quiet
+          RTK=./target/debug/rtk
+          # On Windows the binary has .exe suffix
+          if [[ "$RUNNER_OS" == "Windows" ]]; then RTK="${RTK}.exe"; fi
+          # Non-rewritable payload → exit 0, no stdout
+          echo '{"tool_name":"executeBash","tool_input":{"command":"echo hello"}}' \
+            | $RTK hook kiro 2>/dev/null
+          # Empty stdin → exit 0
+          echo '' | $RTK hook kiro 2>/dev/null
+          # Rewritable payload → exit 0, produces ask suggestion
+          OUTPUT=$(echo '{"tool_name":"executeBash","tool_input":{"command":"git status"}}' \
+            | $RTK hook kiro 2>/dev/null)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "permissionDecision"
+
   security:
     name: Security Scan
     needs: clippy

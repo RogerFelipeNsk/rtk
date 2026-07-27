@@ -6,7 +6,7 @@
 
 The **lifecycle management** layer for LLM agent hooks: install, uninstall, verify integrity, audit usage, and manage trust. This component creates and maintains the hook artifacts that live in `hooks/` (root), but does **not** execute rewrite logic itself — that lives in `discover/registry`.
 
-Owns: `rtk init` installation flows (5 agents via `AgentTarget` enum + 3 special modes: Gemini, Codex, OpenCode), SHA-256 integrity verification, hook version checking, audit log analysis, `rtk rewrite` CLI entry point, and TOML filter trust management.
+Owns: `rtk init` installation flows (6 agents via `AgentTarget` enum + 3 special modes: Gemini, Codex, OpenCode), SHA-256 integrity verification, hook version checking, audit log analysis, `rtk rewrite` CLI entry point, and TOML filter trust management.
 
 Does **not** own: the deployed hook scripts themselves (that's `hooks/`), the rewrite pattern registry (that's `discover/`), or command filtering (that's `cmds/`).
 
@@ -32,6 +32,7 @@ LLM agent integration layer that installs, validates, and executes command-rewri
 | Cursor | `rtk init -g --agent cursor` | Cursor hook | hooks.json |
 | Pi | `rtk init --agent pi` | `.pi/extensions/rtk.ts` | -- |
 | Hermes | `rtk init --agent hermes` | Python plugin in `~/.hermes/plugins/rtk-rewrite/` | `config.yaml` `plugins.enabled` |
+| Kiro | `rtk init --agent kiro` | `.kiro/steering/rtk.md`, `.kiro/hooks/rtk-rewrite.kiro.hook` | -- |
 
 
 ## Integrity Verification
@@ -90,12 +91,13 @@ Rules are loaded from all Claude Code `settings.json` files (project + global, i
 | Gemini CLI (rtk hook gemini) | No (allow/deny only) | allow (limitation — no ask mode in Gemini) |
 | Copilot CLI (rtk hook copilot) | No updatedInput | deny-with-suggestion (unchanged) |
 | Codex | ask parsed but no-op | allow (limitation — fails open) |
+| Kiro (rtk hook kiro) | Yes | `permissionDecision: "ask"` — user prompted with rtk suggestion |
 
 ### Implementation
 
-- `permissions.rs` — loads deny/ask/allow rules, evaluates precedence, returns `PermissionVerdict`
+- `permissions.rs` — loads deny/ask/allow rules, evaluates precedence, returns `PermissionVerdict`. Hosts: `Claude`, `Cursor`, `Gemini`, `Droid`, `Kiro`
 - `rewrite_cmd.rs` — maps verdict to exit code (consumed by shell hook)
-- `hook_cmd.rs` — maps verdict to JSON `permissionDecision` field (Copilot/Gemini)
+- `hook_cmd.rs` — maps verdict to JSON `permissionDecision` field (Copilot/Gemini/Kiro); `run_kiro()` handles the Kiro PreToolUse hook protocol
 
 ## Exit Code Contract
 

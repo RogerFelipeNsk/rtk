@@ -1,6 +1,6 @@
 ---
 title: Supported Agents
-description: How to integrate RTK with Claude Code, Cursor, Copilot, Cline, Windsurf, Codex, OpenCode, Hermes, Kilo Code, Antigravity, and Factory Droid
+description: How to integrate RTK with Claude Code, Cursor, Copilot, Cline, Windsurf, Codex, OpenCode, Hermes, Kilo Code, Antigravity, Factory Droid, and Kiro
 sidebar:
   order: 3
 ---
@@ -38,6 +38,7 @@ Agent runs "cargo test"
 | Pi | TypeScript extension (`tool_call` event) | Yes |
 | Hermes | Python plugin (`terminal` command mutation) | Yes |
 | Factory Droid | Shell hook (`PreToolUse`, matcher `Execute`) | Yes |
+| Kiro IDE / CLI | Steering file (prompt-level) + optional shell hook (`PreToolUse`) | No (ask-with-suggestion) |
 | Cline / Roo Code | Rules file (prompt-level) | N/A |
 | Windsurf | Rules file (prompt-level) | N/A |
 | Codex CLI | AGENTS.md instructions | N/A |
@@ -157,6 +158,29 @@ rtk init --uninstall --agent droid
 ```
 
 Removes only RTK's hook entry; other hooks and settings are untouched.
+
+### Kiro IDE / CLI
+
+```bash
+rtk init --agent kiro       # project-scoped (.kiro/steering/ + .kiro/hooks/)
+rtk init --agent kiro --global   # user-scoped (~/.kiro/steering/ + ~/.kiro/hooks/)
+```
+
+Installs a dual mechanism:
+
+1. **Steering file** (primary) — `.kiro/steering/rtk.md` (project) or `~/.kiro/steering/rtk.md` (global). Always-included prompt guidance instructing the Kiro agent to prefix shell commands with `rtk`. Works in both Kiro IDE and Kiro CLI.
+2. **PreToolUse hook** (optional reinforcement) — `.kiro/hooks/rtk-rewrite.kiro.hook` (project) or `~/.kiro/hooks/rtk-rewrite.kiro.hook` (global). Runs `rtk hook kiro` natively. Since Kiro's hook contract does not support transparent command replacement, it returns an ask-with-suggestion (`permissionDecision: "ask"`) with the equivalent `rtk <cmd>` in the reason field.
+
+The steering file is the recommended path — it is low-maintenance, covers platforms where the hook is unavailable, and works identically in IDE and CLI sessions. The hook adds an extra layer of enforcement when available.
+
+Uninstall:
+
+```bash
+rtk init --uninstall --agent kiro
+rtk init --uninstall --agent kiro --global
+```
+
+Removes only RTK's steering file and hook entry. Other files in `.kiro/steering/` or `.kiro/hooks/` are untouched.
 
 ### Cline / Roo Code
 

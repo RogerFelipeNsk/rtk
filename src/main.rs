@@ -54,6 +54,8 @@ pub enum AgentTarget {
     Hermes,
     /// Factory Droid CLI
     Droid,
+    /// Kiro IDE and CLI
+    Kiro,
 }
 
 #[derive(Parser)]
@@ -859,6 +861,8 @@ enum HookCommands {
     Copilot,
     /// Process Factory Droid PreToolUse hook (reads JSON from stdin)
     Droid,
+    /// Process Kiro IDE/CLI PreToolUse hook (reads JSON from stdin)
+    Kiro,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -1534,6 +1538,8 @@ where
         uninstall_hermes(ctx)
     } else if agent == Some(AgentTarget::Droid) {
         hooks::init::uninstall_droid(global, ctx)
+    } else if agent == Some(AgentTarget::Kiro) {
+        hooks::init::uninstall_kiro(global, ctx)
     } else {
         let cursor = agent == Some(AgentTarget::Cursor);
         let pi = agent == Some(AgentTarget::Pi);
@@ -1982,6 +1988,7 @@ fn run_cli() -> Result<i32> {
             };
             if show {
                 hooks::init::show_config(codex)?;
+                hooks::init::show_kiro_config();
             } else if uninstall && copilot {
                 if global {
                     hooks::init::uninstall_copilot_global(ctx)?;
@@ -2036,6 +2043,8 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_hermes_mode(ctx)?;
             } else if agent == Some(AgentTarget::Droid) {
                 hooks::init::run_droid_mode(global, ctx)?;
+            } else if agent == Some(AgentTarget::Kiro) {
+                hooks::init::run_kiro_mode(global, ctx)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -2397,6 +2406,10 @@ fn run_cli() -> Result<i32> {
             }
             HookCommands::Droid => {
                 hooks::hook_cmd::run_droid()?;
+                0
+            }
+            HookCommands::Kiro => {
+                hooks::hook_cmd::run_kiro()?;
                 0
             }
             HookCommands::Check { agent: _, command } => {
@@ -3576,5 +3589,51 @@ mod tests {
             }
             _ => panic!("Expected Init command"),
         }
+    }
+
+    #[test]
+    fn test_init_agent_kiro_parses() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--agent", "kiro"]).unwrap();
+        match cli.command {
+            Commands::Init { agent, .. } => {
+                assert_eq!(
+                    agent,
+                    Some(AgentTarget::Kiro),
+                    "--agent kiro must set Kiro variant"
+                );
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_uninstall_agent_kiro_parses() {
+        let cli =
+            Cli::try_parse_from(["rtk", "init", "--uninstall", "--agent", "kiro", "--global"])
+                .unwrap();
+        match cli.command {
+            Commands::Init {
+                uninstall,
+                agent,
+                global,
+                ..
+            } => {
+                assert!(uninstall);
+                assert_eq!(agent, Some(AgentTarget::Kiro));
+                assert!(global);
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_hook_kiro_parses() {
+        let cli = Cli::try_parse_from(["rtk", "hook", "kiro"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Hook {
+                command: HookCommands::Kiro
+            }
+        ));
     }
 }
