@@ -71,9 +71,9 @@ pub const KIRO_STEERING_FILE: &str = "rtk.md";
 /// Agent-hooks subdirectory.
 #[allow(dead_code)]
 pub const KIRO_HOOKS_SUBDIR: &str = "hooks";
-/// RTK hook config file name (agent-hook JSON, standalone v3 format).
+/// RTK hook config file name (agent-hook JSON, v1 `hooks` array format).
 #[allow(dead_code)]
-pub const KIRO_HOOK_FILE: &str = "rtk-rewrite.kiro.hook";
+pub const KIRO_HOOK_FILE: &str = "rtk-rewrite.json";
 /// Native Rust hook command dispatched by the Kiro PreToolUse hook.
 #[allow(dead_code)]
 pub const KIRO_HOOK_COMMAND: &str = "rtk hook kiro";

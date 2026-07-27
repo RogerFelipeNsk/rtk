@@ -1954,26 +1954,38 @@ fn run_kimi_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
 /// Embedded Kiro steering file (always-included prompt guidance).
 const KIRO_STEERING: &str = include_str!("../../hooks/kiro/rtk.md");
 
-/// Embedded Kiro hook config (standalone .kiro.hook JSON).
-const KIRO_HOOK_JSON: &str = include_str!("../../hooks/kiro/rtk-rewrite.kiro.hook");
+/// Embedded Kiro hook config (agent-hook JSON, v1 `hooks` array format).
+const KIRO_HOOK_JSON: &str = include_str!("../../hooks/kiro/rtk-rewrite.json");
 
 /// Install RTK integration for Kiro IDE/CLI.
 ///
-/// Writes both the steering file (`.kiro/steering/rtk.md`) and the hook config
-/// (`.kiro/hooks/rtk-rewrite.kiro.hook`) into the chosen scope.
+/// Kiro resolves the two artifacts from different scopes, so each one is
+/// installed where Kiro actually reads it:
 ///
-/// - `global=false`: project scope → `<cwd>/.kiro/…`
-/// - `global=true`:  user scope   → `~/.kiro/…`
+/// - **Steering** (`steering/rtk.md`) — honored at both user and workspace
+///   level. `global=true` writes `~/.kiro/steering/rtk.md` (applies to every
+///   project); `global=false` writes `<cwd>/.kiro/steering/rtk.md`.
+/// - **Hook** (`hooks/rtk-rewrite.json`) — workspace-scoped **only**. Kiro
+///   never reads `~/.kiro/hooks/`, so the hook always goes to
+///   `<cwd>/.kiro/hooks/` regardless of `global`.
 pub fn run_kiro_mode(global: bool, ctx: InitContext) -> Result<()> {
-    let kiro_dir = resolve_kiro_dir(global)?;
-    run_kiro_mode_at(&kiro_dir, global, ctx)
+    let steering_root = resolve_kiro_dir(global)?;
+    let project_root = resolve_kiro_dir(false)?;
+    run_kiro_mode_at(&steering_root, &project_root, global, ctx)
 }
 
-fn run_kiro_mode_at(kiro_dir: &Path, global: bool, ctx: InitContext) -> Result<()> {
+/// Install the steering file under `steering_root` and the hook under
+/// `project_root` (hooks are workspace-scoped in Kiro).
+fn run_kiro_mode_at(
+    steering_root: &Path,
+    project_root: &Path,
+    global: bool,
+    ctx: InitContext,
+) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
 
-    let steering_dir = kiro_dir.join(KIRO_STEERING_SUBDIR);
-    let hooks_dir = kiro_dir.join(KIRO_HOOKS_SUBDIR);
+    let steering_dir = steering_root.join(KIRO_STEERING_SUBDIR);
+    let hooks_dir = project_root.join(KIRO_HOOKS_SUBDIR);
 
     if !dry_run {
         fs::create_dir_all(&steering_dir).with_context(|| {
@@ -1990,30 +2002,38 @@ fn run_kiro_mode_at(kiro_dir: &Path, global: bool, ctx: InitContext) -> Result<(
         })?;
     }
 
-    // 1. Write steering file
+    // 1. Steering file — scope follows the --global flag.
     let steering_path = steering_dir.join(KIRO_STEERING_FILE);
     let steering_changed = write_if_changed(&steering_path, KIRO_STEERING, "Kiro steering", ctx)?;
 
-    // 2. Write hook config file
+    // 2. Hook config — always project-scoped (Kiro ignores ~/.kiro/hooks/).
     let hook_path = hooks_dir.join(KIRO_HOOK_FILE);
     let hook_changed = write_if_changed(&hook_path, KIRO_HOOK_JSON, "Kiro hook config", ctx)?;
 
     if dry_run {
         print_dry_run_footer();
     } else {
-        let scope = if global { "global" } else { "project" };
-        println!("\nRTK configured for Kiro ({scope}).\n");
-        println!("  Steering: {}", steering_path.display());
+        let steering_scope = if global { "global" } else { "project" };
+        println!("\nRTK configured for Kiro.\n");
+        println!("  Steering ({steering_scope}): {}", steering_path.display());
         if steering_changed {
             println!("            (installed)");
         } else {
             println!("            (already up to date)");
         }
-        println!("  Hook:     {}", hook_path.display());
+        println!("  Hook (project): {}", hook_path.display());
         if hook_changed {
             println!("            (installed)");
         } else {
             println!("            (already up to date)");
+        }
+        if global {
+            println!(
+                "\n  Note: Kiro reads agent hooks only from the workspace \
+                 (.kiro/hooks/),\n  so the hook was installed in this project. \
+                 Run `rtk init --agent kiro`\n  in each repository where you \
+                 want the hook reinforcement."
+            );
         }
         println!("\n  Kiro will now use rtk commands for token savings.");
         println!("  Test with: git status\n");
@@ -2024,19 +2044,29 @@ fn run_kiro_mode_at(kiro_dir: &Path, global: bool, ctx: InitContext) -> Result<(
 
 /// Uninstall RTK integration for Kiro IDE/CLI.
 ///
-/// Removes `rtk.md` from the steering directory and `rtk-rewrite.kiro.hook`
-/// from the hooks directory. Preserves any other user-managed files.
+/// Mirrors the install scopes: the steering file is removed from the scope
+/// selected by `global`, while the hook is always removed from the workspace
+/// (`<cwd>/.kiro/hooks/`) because Kiro only reads hooks from there.
+/// Preserves any other user-managed files.
 pub fn uninstall_kiro(global: bool, ctx: InitContext) -> Result<()> {
-    let kiro_dir = resolve_kiro_dir(global)?;
-    uninstall_kiro_at(&kiro_dir, global, ctx)
+    let steering_root = resolve_kiro_dir(global)?;
+    let project_root = resolve_kiro_dir(false)?;
+    uninstall_kiro_at(&steering_root, &project_root, global, ctx)
 }
 
-fn uninstall_kiro_at(kiro_dir: &Path, global: bool, ctx: InitContext) -> Result<()> {
+fn uninstall_kiro_at(
+    steering_root: &Path,
+    project_root: &Path,
+    global: bool,
+    ctx: InitContext,
+) -> Result<()> {
     let InitContext { verbose, dry_run } = ctx;
     let mut removed = Vec::new();
 
-    // 1. Remove steering file
-    let steering_path = kiro_dir.join(KIRO_STEERING_SUBDIR).join(KIRO_STEERING_FILE);
+    // 1. Remove steering file (scope follows --global)
+    let steering_path = steering_root
+        .join(KIRO_STEERING_SUBDIR)
+        .join(KIRO_STEERING_FILE);
     if steering_path.exists() {
         if dry_run {
             println!(
@@ -2058,8 +2088,8 @@ fn uninstall_kiro_at(kiro_dir: &Path, global: bool, ctx: InitContext) -> Result<
         removed.push(format!("Steering: {}", steering_path.display()));
     }
 
-    // 2. Remove hook config file
-    let hook_path = kiro_dir.join(KIRO_HOOKS_SUBDIR).join(KIRO_HOOK_FILE);
+    // 2. Remove hook config file (always project-scoped)
+    let hook_path = project_root.join(KIRO_HOOKS_SUBDIR).join(KIRO_HOOK_FILE);
     if hook_path.exists() {
         if dry_run {
             println!(
@@ -2082,7 +2112,11 @@ fn uninstall_kiro_at(kiro_dir: &Path, global: bool, ctx: InitContext) -> Result<
     if removed.is_empty() {
         println!("RTK Kiro support was not installed (nothing to remove)");
     } else {
-        let scope = if global { "global" } else { "project" };
+        let scope = if global {
+            "global steering + project hook"
+        } else {
+            "project"
+        };
         let header = if dry_run {
             format!("[dry-run] would uninstall RTK for Kiro ({scope}):")
         } else {
@@ -2181,15 +2215,15 @@ fn show_kiro_config_at(project_kiro: &Path, global_kiro: Option<&Path>) -> Vec<S
             lines.push("[--] Kiro (global): steering not found".to_string());
         }
 
+        // Kiro reads agent hooks only from the workspace. A file under
+        // ~/.kiro/hooks/ is inert — flag it as such instead of reporting [ok],
+        // and point the user at the project-scoped install.
         if global_hook.exists() {
-            let content = fs::read_to_string(&global_hook).unwrap_or_default();
-            if content.contains(KIRO_HOOK_COMMAND) {
-                lines.push("[ok] Kiro (global): hook config installed".to_string());
-            } else {
-                lines.push("[--] Kiro (global): hook config exists but not RTK".to_string());
-            }
-        } else {
-            lines.push("[--] Kiro (global): hook config not found".to_string());
+            lines.push(
+                "[warn] Kiro (global): hook config present but inert \
+                 (Kiro reads hooks only from .kiro/hooks/ in the workspace)"
+                    .to_string(),
+            );
         }
     } else {
         lines.push("[--] Kiro (global): home directory not found".to_string());
@@ -8099,10 +8133,10 @@ mod tests {
     fn test_kiro_mode_creates_steering_and_hook() {
         let temp = TempDir::new().unwrap();
         let kiro_dir = temp.path().join(".kiro");
-        run_kiro_mode_at(&kiro_dir, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
 
         let steering_path = kiro_dir.join("steering").join("rtk.md");
-        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.kiro.hook");
+        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.json");
 
         assert!(steering_path.exists(), "Steering file should be created");
         assert!(hook_path.exists(), "Hook config should be created");
@@ -8141,14 +8175,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let kiro_dir = temp.path().join(".kiro");
 
-        run_kiro_mode_at(&kiro_dir, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
         let steering_path = kiro_dir.join("steering").join("rtk.md");
-        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.kiro.hook");
+        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.json");
         let first_steering = fs::read_to_string(&steering_path).unwrap();
         let first_hook = fs::read_to_string(&hook_path).unwrap();
 
         // Second run should be a no-op
-        run_kiro_mode_at(&kiro_dir, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
         let second_steering = fs::read_to_string(&steering_path).unwrap();
         let second_hook = fs::read_to_string(&hook_path).unwrap();
 
@@ -8168,7 +8202,7 @@ mod tests {
             dry_run: true,
             ..Default::default()
         };
-        run_kiro_mode_at(&kiro_dir, false, ctx).unwrap();
+        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, ctx).unwrap();
 
         assert!(
             !kiro_dir.exists(),
@@ -8182,14 +8216,14 @@ mod tests {
         let kiro_dir = temp.path().join(".kiro");
 
         // Install first
-        run_kiro_mode_at(&kiro_dir, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
         let steering_path = kiro_dir.join("steering").join("rtk.md");
-        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.kiro.hook");
+        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.json");
         assert!(steering_path.exists());
         assert!(hook_path.exists());
 
         // Uninstall
-        uninstall_kiro_at(&kiro_dir, false, InitContext::default()).unwrap();
+        uninstall_kiro_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
         assert!(!steering_path.exists(), "Steering file should be removed");
         assert!(!hook_path.exists(), "Hook config should be removed");
     }
@@ -8200,7 +8234,7 @@ mod tests {
         let kiro_dir = temp.path().join(".kiro");
 
         // Install RTK
-        run_kiro_mode_at(&kiro_dir, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
 
         // Add a user file in the same directories
         let user_steering = kiro_dir.join("steering").join("user-rules.md");
@@ -8209,7 +8243,7 @@ mod tests {
         fs::write(&user_hook, r#"{"name": "user hook"}"#).unwrap();
 
         // Uninstall
-        uninstall_kiro_at(&kiro_dir, false, InitContext::default()).unwrap();
+        uninstall_kiro_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
 
         // User files must remain
         assert!(
@@ -8233,7 +8267,7 @@ mod tests {
         let kiro_dir = temp.path().join(".kiro");
 
         // Uninstall on clean filesystem should not error
-        uninstall_kiro_at(&kiro_dir, false, InitContext::default()).unwrap();
+        uninstall_kiro_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
     }
 
     #[test]
@@ -8242,15 +8276,15 @@ mod tests {
         let kiro_dir = temp.path().join(".kiro");
 
         // Install first
-        run_kiro_mode_at(&kiro_dir, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
         let steering_path = kiro_dir.join("steering").join("rtk.md");
-        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.kiro.hook");
+        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.json");
 
         let ctx = InitContext {
             dry_run: true,
             ..Default::default()
         };
-        uninstall_kiro_at(&kiro_dir, false, ctx).unwrap();
+        uninstall_kiro_at(&kiro_dir, &kiro_dir, false, ctx).unwrap();
 
         // Files must still exist
         assert!(
@@ -8277,32 +8311,35 @@ mod tests {
         fs::write(&user_file, "custom content").unwrap();
 
         // Install
-        run_kiro_mode_at(&kiro_dir, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
         assert!(steering_dir.join("rtk.md").exists());
-        assert!(hooks_dir.join("rtk-rewrite.kiro.hook").exists());
+        assert!(hooks_dir.join("rtk-rewrite.json").exists());
 
         // Uninstall
-        uninstall_kiro_at(&kiro_dir, false, InitContext::default()).unwrap();
+        uninstall_kiro_at(&kiro_dir, &kiro_dir, false, InitContext::default()).unwrap();
 
         // RTK artifacts gone, user content preserved
         assert!(!steering_dir.join("rtk.md").exists());
-        assert!(!hooks_dir.join("rtk-rewrite.kiro.hook").exists());
+        assert!(!hooks_dir.join("rtk-rewrite.json").exists());
         assert!(user_file.exists());
         assert_eq!(fs::read_to_string(&user_file).unwrap(), "custom content");
     }
 
     #[test]
     fn test_kiro_hook_json_format() {
-        // Verify the embedded hook JSON has the expected structure
+        // Verify the embedded hook JSON matches Kiro's v1 `hooks` array schema
         let v: serde_json::Value = serde_json::from_str(KIRO_HOOK_JSON).unwrap();
-        assert_eq!(v["when"]["type"], "PreToolUse");
+        assert_eq!(v["version"], "v1");
+        let hooks = v["hooks"].as_array().expect("hooks must be an array");
+        assert_eq!(hooks.len(), 1, "exactly one hook entry expected");
+        assert_eq!(v["hooks"][0]["trigger"], "PreToolUse");
+        assert_eq!(v["hooks"][0]["matcher"], "execute_bash");
         assert!(
-            v["when"]["matcher"].as_str().is_some(),
-            "matcher must be present"
+            v["hooks"][0]["name"].as_str().is_some(),
+            "name must be present"
         );
-        assert_eq!(v["then"]["type"], "command");
-        assert_eq!(v["then"]["command"], "rtk hook kiro");
-        assert_eq!(v["enabled"], true);
+        assert_eq!(v["hooks"][0]["action"]["type"], "command");
+        assert_eq!(v["hooks"][0]["action"]["command"], "rtk hook kiro");
     }
 
     #[test]
@@ -8333,19 +8370,34 @@ mod tests {
     #[test]
     fn test_kiro_mode_global_scope_creates_artifacts() {
         let temp = TempDir::new().unwrap();
-        let kiro_dir = temp.path().join(".kiro");
+        let global_root = temp.path().join("home").join(".kiro");
+        let project_root = temp.path().join("project").join(".kiro");
 
-        // global=true should still create the same artifacts via the `_at` variant
-        run_kiro_mode_at(&kiro_dir, true, InitContext::default()).unwrap();
+        // global=true: steering goes to the global root, hook to the project root
+        run_kiro_mode_at(&global_root, &project_root, true, InitContext::default()).unwrap();
 
-        let steering_path = kiro_dir.join("steering").join("rtk.md");
-        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.kiro.hook");
+        let steering_path = global_root.join("steering").join("rtk.md");
+        let hook_path = project_root.join("hooks").join("rtk-rewrite.json");
 
         assert!(
             steering_path.exists(),
-            "Global steering file should be created"
+            "Global steering file should be created under the global root"
         );
-        assert!(hook_path.exists(), "Global hook config should be created");
+        assert!(
+            hook_path.exists(),
+            "Hook config should be created under the project root"
+        );
+
+        // The hook must NOT land in the global root: Kiro ignores ~/.kiro/hooks/
+        assert!(
+            !global_root.join("hooks").join("rtk-rewrite.json").exists(),
+            "Hook config must not be written to the global root"
+        );
+        // And the steering must not leak into the project root
+        assert!(
+            !project_root.join("steering").join("rtk.md").exists(),
+            "Global install must not write project steering"
+        );
 
         // Verify content matches expectations
         let steering = fs::read_to_string(&steering_path).unwrap();
@@ -8355,26 +8407,61 @@ mod tests {
 
         let hook = fs::read_to_string(&hook_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&hook).unwrap();
-        assert_eq!(v["when"]["type"], "PreToolUse");
-        assert_eq!(v["then"]["command"], "rtk hook kiro");
+        assert_eq!(v["version"], "v1");
+        assert_eq!(v["hooks"][0]["trigger"], "PreToolUse");
+        assert_eq!(v["hooks"][0]["matcher"], "execute_bash");
+        assert_eq!(v["hooks"][0]["action"]["command"], "rtk hook kiro");
+    }
+
+    #[test]
+    fn test_kiro_global_install_does_not_write_global_hook() {
+        let temp = TempDir::new().unwrap();
+        let global_root = temp.path().join("home").join(".kiro");
+        let project_root = temp.path().join("project").join(".kiro");
+
+        run_kiro_mode_at(&global_root, &project_root, true, InitContext::default()).unwrap();
+
+        let global_hooks_dir = global_root.join("hooks");
+        assert!(
+            !global_hooks_dir.join("rtk-rewrite.json").exists(),
+            "Global install must never create {}",
+            global_hooks_dir.join("rtk-rewrite.json").display()
+        );
+
+        // If the directory happens to exist it must at least be free of RTK hooks.
+        if global_hooks_dir.exists() {
+            let entries: Vec<String> = fs::read_dir(&global_hooks_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            assert!(
+                !entries.iter().any(|n| n.contains("rtk")),
+                "No RTK hook artifacts expected under the global root, found: {entries:?}"
+            );
+        }
     }
 
     #[test]
     fn test_kiro_uninstall_global_scope_removes_artifacts() {
         let temp = TempDir::new().unwrap();
-        let kiro_dir = temp.path().join(".kiro");
+        let global_root = temp.path().join("home").join(".kiro");
+        let project_root = temp.path().join("project").join(".kiro");
 
         // Install in global scope
-        run_kiro_mode_at(&kiro_dir, true, InitContext::default()).unwrap();
-        let steering_path = kiro_dir.join("steering").join("rtk.md");
-        let hook_path = kiro_dir.join("hooks").join("rtk-rewrite.kiro.hook");
+        run_kiro_mode_at(&global_root, &project_root, true, InitContext::default()).unwrap();
+        let steering_path = global_root.join("steering").join("rtk.md");
+        let hook_path = project_root.join("hooks").join("rtk-rewrite.json");
         assert!(steering_path.exists());
         assert!(hook_path.exists());
 
         // Uninstall in global scope
-        uninstall_kiro_at(&kiro_dir, true, InitContext::default()).unwrap();
+        uninstall_kiro_at(&global_root, &project_root, true, InitContext::default()).unwrap();
         assert!(!steering_path.exists(), "Global steering should be removed");
-        assert!(!hook_path.exists(), "Global hook config should be removed");
+        assert!(
+            !hook_path.exists(),
+            "Project hook config should be removed by a global uninstall"
+        );
     }
 
     #[test]
@@ -8383,9 +8470,9 @@ mod tests {
         let project_kiro = temp.path().join("project").join(".kiro");
         let global_kiro = temp.path().join("global").join(".kiro");
 
-        // Install in both scopes
-        run_kiro_mode_at(&project_kiro, false, InitContext::default()).unwrap();
-        run_kiro_mode_at(&global_kiro, true, InitContext::default()).unwrap();
+        // Project install (steering + hook) and a global steering install.
+        run_kiro_mode_at(&project_kiro, &project_kiro, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&global_kiro, &project_kiro, true, InitContext::default()).unwrap();
 
         let lines = show_kiro_config_at(&project_kiro, Some(&global_kiro));
 
@@ -8408,11 +8495,46 @@ mod tests {
                 .any(|l| l.contains("[ok] Kiro (global): steering installed")),
             "Show should report global steering as installed"
         );
+        // The hook is project-scoped only: `--show` must never claim a global
+        // hook is installed.
         assert!(
-            lines
+            !lines
+                .iter()
+                .any(|l| l.contains("Kiro (global): hook config installed")),
+            "Show must not report a global hook as installed: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Kiro (global): hook")),
+            "No global hook line expected when no global hook file exists: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_kiro_show_warns_about_inert_global_hook() {
+        let temp = TempDir::new().unwrap();
+        let project_kiro = temp.path().join("project").join(".kiro");
+        let global_kiro = temp.path().join("global").join(".kiro");
+
+        // Simulate a leftover (inert) hook file under the global root.
+        let global_hooks = global_kiro.join("hooks");
+        fs::create_dir_all(&global_hooks).unwrap();
+        fs::write(global_hooks.join("rtk-rewrite.json"), KIRO_HOOK_JSON).unwrap();
+
+        let lines = show_kiro_config_at(&project_kiro, Some(&global_kiro));
+
+        let warn = lines
+            .iter()
+            .find(|l| l.starts_with("[warn] Kiro (global): hook config present but inert"))
+            .unwrap_or_else(|| panic!("Expected inert-hook warning, got: {lines:?}"));
+        assert!(
+            warn.contains(".kiro/hooks/"),
+            "Warning should point at the workspace hooks path: {warn}"
+        );
+        assert!(
+            !lines
                 .iter()
                 .any(|l| l.contains("[ok] Kiro (global): hook config installed")),
-            "Show should report global hook as installed"
+            "An inert global hook must never be reported as installed: {lines:?}"
         );
     }
 
@@ -8443,11 +8565,11 @@ mod tests {
                 .any(|l| l.contains("[--] Kiro (global): steering not found")),
             "Show should report global steering as not found"
         );
+        // Hooks are workspace-only, so an absent global hook is reported as
+        // nothing at all (not as a missing artifact).
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("[--] Kiro (global): hook config not found")),
-            "Show should report global hook as not found"
+            !lines.iter().any(|l| l.contains("Kiro (global): hook")),
+            "No global hook line expected when absent: {lines:?}"
         );
     }
 
@@ -8458,7 +8580,7 @@ mod tests {
         let global_kiro = temp.path().join("global").join(".kiro");
 
         // Only install in project scope
-        run_kiro_mode_at(&project_kiro, false, InitContext::default()).unwrap();
+        run_kiro_mode_at(&project_kiro, &project_kiro, false, InitContext::default()).unwrap();
 
         let lines = show_kiro_config_at(&project_kiro, Some(&global_kiro));
 
@@ -8471,8 +8593,18 @@ mod tests {
         assert!(
             lines
                 .iter()
+                .any(|l| l.contains("[ok] Kiro (project): hook config installed")),
+            "Project hook should be reported as installed"
+        );
+        assert!(
+            lines
+                .iter()
                 .any(|l| l.contains("[--] Kiro (global): steering not found")),
             "Global steering should be reported as not found"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("Kiro (global): hook")),
+            "No global hook line expected when absent: {lines:?}"
         );
     }
 
@@ -8574,9 +8706,9 @@ mod tests {
             prop_oneof![
                 Just(KiroInitialState::Clean),
                 Just(KiroInitialState::RtkSteeringPresent),
-                user_files_strategy(&["rtk.md", "rtk-rewrite.kiro.hook"])
+                user_files_strategy(&["rtk.md", "rtk-rewrite.json"])
                     .prop_map(KiroInitialState::ThirdPartyHooks),
-                user_files_strategy(&["rtk.md", "rtk-rewrite.kiro.hook"])
+                user_files_strategy(&["rtk.md", "rtk-rewrite.json"])
                     .prop_map(KiroInitialState::RtkAndThirdParty),
             ]
         }
@@ -8612,7 +8744,7 @@ mod tests {
                     }
                     KiroInitialState::RtkSteeringPresent => {
                         // Pre-install RTK (simulates a previous run)
-                        run_kiro_mode_at(&kiro_dir, false, ctx).unwrap();
+                        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, ctx).unwrap();
                     }
                     KiroInitialState::ThirdPartyHooks(files) => {
                         fs::create_dir_all(&steering_dir).unwrap();
@@ -8628,7 +8760,7 @@ mod tests {
                     }
                     KiroInitialState::RtkAndThirdParty(files) => {
                         // Install RTK first, then add third-party files
-                        run_kiro_mode_at(&kiro_dir, false, ctx).unwrap();
+                        run_kiro_mode_at(&kiro_dir, &kiro_dir, false, ctx).unwrap();
                         for (name, content) in files {
                             if name.ends_with(".md") || name.ends_with(".txt") {
                                 fs::write(steering_dir.join(name), content).unwrap();
@@ -8640,13 +8772,13 @@ mod tests {
                 }
 
                 // 2. First install
-                run_kiro_mode_at(&kiro_dir, false, ctx).unwrap();
+                run_kiro_mode_at(&kiro_dir, &kiro_dir, false, ctx).unwrap();
 
                 // Snapshot state after first install
                 let snapshot_after_first = snapshot_dir_recursive(&kiro_dir);
 
                 // 3. Second install (must be identical to first)
-                run_kiro_mode_at(&kiro_dir, false, ctx).unwrap();
+                run_kiro_mode_at(&kiro_dir, &kiro_dir, false, ctx).unwrap();
 
                 // Snapshot state after second install
                 let snapshot_after_second = snapshot_dir_recursive(&kiro_dir);
@@ -8704,11 +8836,11 @@ mod tests {
                 );
                 let hook_file_count = snapshot_after_second
                     .keys()
-                    .filter(|p| p.ends_with("/rtk-rewrite.kiro.hook") || *p == "rtk-rewrite.kiro.hook")
+                    .filter(|p| p.ends_with("/rtk-rewrite.json") || *p == "rtk-rewrite.json")
                     .count();
                 prop_assert_eq!(
                     hook_file_count, 1,
-                    "Exactly one rtk-rewrite.kiro.hook should exist, found {}", hook_file_count
+                    "Exactly one rtk-rewrite.json should exist, found {}", hook_file_count
                 );
 
                 // 7. Verify third-party files preserved
@@ -8777,7 +8909,7 @@ mod tests {
         // For any initial state of `.kiro/steering/` and `.kiro/hooks/` (including random
         // user content and third-party hooks), running `run_kiro_mode` followed by
         // `uninstall_kiro` restores the filesystem byte-for-byte (minus only the RTK
-        // artifacts `rtk.md` and `rtk-rewrite.kiro.hook`). Third-party hooks and user
+        // artifacts `rtk.md` and `rtk-rewrite.json`). Third-party hooks and user
         // content must be preserved.
         proptest! {
             #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
@@ -8785,7 +8917,7 @@ mod tests {
             #[test]
             fn prop_kiro_round_trip_preserves_filesystem(
                 steering_files in user_files_strategy(&["rtk.md"]),
-                hooks_files in user_files_strategy(&["rtk-rewrite.kiro.hook"]),
+                hooks_files in user_files_strategy(&["rtk-rewrite.json"]),
             ) {
                 let temp = TempDir::new().unwrap();
                 let kiro_dir = temp.path().join(".kiro");
@@ -8821,7 +8953,7 @@ mod tests {
 
                 // 3. Install RTK for Kiro
                 let ctx = InitContext { verbose: 0, dry_run: false };
-                run_kiro_mode_at(&kiro_dir, false, ctx).unwrap();
+                run_kiro_mode_at(&kiro_dir, &kiro_dir, false, ctx).unwrap();
 
                 // Verify RTK artifacts were created
                 prop_assert!(steering_dir.join(KIRO_STEERING_FILE).exists());
@@ -8838,7 +8970,7 @@ mod tests {
                 }
 
                 // 4. Uninstall RTK for Kiro
-                uninstall_kiro_at(&kiro_dir, false, ctx).unwrap();
+                uninstall_kiro_at(&kiro_dir, &kiro_dir, false, ctx).unwrap();
 
                 // 5. Verify RTK artifacts are gone
                 prop_assert!(!steering_dir.join(KIRO_STEERING_FILE).exists(),

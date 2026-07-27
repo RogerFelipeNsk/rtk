@@ -32,7 +32,7 @@ LLM agent integration layer that installs, validates, and executes command-rewri
 | Cursor | `rtk init -g --agent cursor` | Cursor hook | hooks.json |
 | Pi | `rtk init --agent pi` | `.pi/extensions/rtk.ts` | -- |
 | Hermes | `rtk init --agent hermes` | Python plugin in `~/.hermes/plugins/rtk-rewrite/` | `config.yaml` `plugins.enabled` |
-| Kiro | `rtk init --agent kiro` | `.kiro/steering/rtk.md`, `.kiro/hooks/rtk-rewrite.kiro.hook` | -- |
+| Kiro | `rtk init --agent kiro` (add `-g` for global steering) | Steering: `~/.kiro/steering/rtk.md` with `-g`, else `.kiro/steering/rtk.md`. Hook: always `.kiro/hooks/rtk-rewrite.json` (project-only — Kiro ignores `~/.kiro/hooks/`) | -- |
 
 
 ## Integrity Verification

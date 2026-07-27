@@ -162,14 +162,29 @@ Removes only RTK's hook entry; other hooks and settings are untouched.
 ### Kiro IDE / CLI
 
 ```bash
-rtk init --agent kiro       # project-scoped (.kiro/steering/ + .kiro/hooks/)
-rtk init --agent kiro --global   # user-scoped (~/.kiro/steering/ + ~/.kiro/hooks/)
+rtk init --agent kiro            # steering + hook, both in this project
+rtk init --agent kiro --global    # steering in ~/.kiro, hook still in this project
 ```
 
 Installs a dual mechanism:
 
 1. **Steering file** (primary) — `.kiro/steering/rtk.md` (project) or `~/.kiro/steering/rtk.md` (global). Always-included prompt guidance instructing the Kiro agent to prefix shell commands with `rtk`. Works in both Kiro IDE and Kiro CLI.
-2. **PreToolUse hook** (optional reinforcement) — `.kiro/hooks/rtk-rewrite.kiro.hook` (project) or `~/.kiro/hooks/rtk-rewrite.kiro.hook` (global). Runs `rtk hook kiro` natively. Since Kiro's hook contract does not support transparent command replacement, it returns an ask-with-suggestion (`permissionDecision: "ask"`) with the equivalent `rtk <cmd>` in the reason field.
+2. **PreToolUse hook** (optional reinforcement) — `.kiro/hooks/rtk-rewrite.json`, always inside the workspace. Runs `rtk hook kiro` natively. Since Kiro's hook contract does not support transparent command replacement, it returns an ask-with-suggestion (`permissionDecision: "ask"`) with the equivalent `rtk <cmd>` in the reason field.
+
+#### Scopes: `--global` affects the steering only
+
+The two artifacts live in different scopes because Kiro resolves them differently:
+
+| Artifact | `--global` | Default (project) |
+| --- | --- | --- |
+| Steering (`steering/rtk.md`) | `~/.kiro/steering/` — applies to every project | `<repo>/.kiro/steering/` |
+| Hook (`hooks/rtk-rewrite.json`) | `<repo>/.kiro/hooks/` | `<repo>/.kiro/hooks/` |
+
+Kiro reads agent hooks **only** from `.kiro/hooks/` in the open workspace; a file in `~/.kiro/hooks/` is never loaded. So `--global` installs the steering globally (it applies to all projects) while the hook stays project-scoped and is written into the repository you ran the command from.
+
+Run `rtk init --agent kiro` in each repository where you want the hook reinforcement. A single `--global` run is enough for the steering.
+
+If you have a leftover `~/.kiro/hooks/rtk-rewrite.json` from an older RTK version, `rtk init --show` flags it as present but inert — delete it, it does nothing.
 
 The steering file is the recommended path — it is low-maintenance, covers platforms where the hook is unavailable, and works identically in IDE and CLI sessions. The hook adds an extra layer of enforcement when available.
 
@@ -180,7 +195,7 @@ rtk init --uninstall --agent kiro
 rtk init --uninstall --agent kiro --global
 ```
 
-Removes only RTK's steering file and hook entry. Other files in `.kiro/steering/` or `.kiro/hooks/` are untouched.
+Removes only RTK's steering file and hook entry (the hook from the project scope, mirroring install). Other files in `.kiro/steering/` or `.kiro/hooks/` are untouched.
 
 ### Cline / Roo Code
 
