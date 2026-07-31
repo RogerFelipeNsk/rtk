@@ -5,8 +5,9 @@
 ## Specifics
 
 - Uses the `rtk hook kiro` Rust binary (not a shell script) — no `jq` dependency
-- Dual mechanism: **steering file** (`.kiro/steering/rtk.md`, prompt-level guidance) as primary integration, plus an optional **PreToolUse hook** (`.kiro/hooks/rtk-rewrite.json`) for ask-with-suggestion reinforcement
-- Hook returns `permissionDecision: "ask"` with the suggested `rtk` command (Kiro's PreToolUse API does not support transparent command rewrite / `updatedInput`)
+- Dual mechanism: **steering file** (`.kiro/steering/rtk.md`, prompt-level guidance) as primary integration, plus an optional **PreToolUse hook** (`.kiro/hooks/rtk-rewrite.json`) for deny-with-suggestion reinforcement
+- Hook uses **deny-with-suggestion**: exit code `2` plus the suggested `rtk` command on stderr, which Kiro forwards to the agent so it re-issues the command (Kiro's PreToolUse API does not support transparent command rewrite / `updatedInput`)
+- The retry is idempotent: an already-`rtk` command never rewrites, so the second attempt passes through and the hook cannot loop
 - Exits silently (exit 0, no output) on any failure: invalid JSON, missing command, no rewrite match, stdin > 1 MiB
 - Structured for future transparent rewrite if Kiro exposes an `updatedInput`-style field
 
@@ -30,7 +31,10 @@ The Kiro PreToolUse hook is registered via a JSON config file at `.kiro/hooks/rt
 1. Reads the JSON payload from stdin (capped at 1 MiB)
 2. Extracts the shell command from `tool_input.command`
 3. Delegates to the shared rewrite decision flow (`decide_hook_action`)
-4. Emits an ask-with-suggestion response if a rewrite exists, or produces no output (exit 0) otherwise
+4. If a rewrite exists: writes `RTK: use \`rtk <cmd>\` …` to stderr and exits `2`. Kiro blocks the raw command and feeds that text to the agent, which re-issues the `rtk` form
+5. Otherwise: produces no output and exits `0`, so the original command runs unmodified
+
+Why not `ask`? Kiro's `ask` decision runs the **original** command on approval — it costs a user confirmation and saves nothing, since there is no transparent-rewrite field. Deny-with-suggestion routes the correction to the agent instead of the user.
 
 ## Hook File Format
 
@@ -89,41 +93,37 @@ Kiro sends the session context, hook event, tool name, and tool input:
 | `tool_name` | string | Name of the tool being invoked (matched by `executeBash`) |
 | `tool_input` | object | Tool arguments; `command` is the shell command string |
 
-### Output (stdout — hook → Kiro) — ask-with-suggestion
+### Output (stderr — hook → Kiro) — deny-with-suggestion
 
-When the command has an RTK equivalent:
+The hook writes nothing to stdout. When the command has an RTK equivalent, it exits `2` and emits a single stderr line, which Kiro forwards to the agent:
 
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "ask",
-    "permissionDecisionReason": "RTK: considere usar `rtk git status` para economizar 60-90% de tokens"
-  }
-}
+```
+RTK: use `rtk git status` (economiza 60-90% de tokens). Reemita o comando com o prefixo `rtk`.
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `hookSpecificOutput.hookEventName` | string | Echo of the hook event (`"PreToolUse"`) |
-| `hookSpecificOutput.permissionDecision` | string | `"ask"` — prompts the user before executing |
-| `hookSpecificOutput.permissionDecisionReason` | string | Human-readable suggestion with the `rtk` command |
+| Channel | Value | Description |
+|---------|-------|-------------|
+| exit code | `2` | Kiro blocks the tool call and feeds stderr to the model |
+| stderr | suggestion line | Names the `rtk` command and instructs the agent to re-issue it |
+| stdout | *(empty)* | The hook never writes structured JSON |
+
+The agent then re-issues `rtk git status`. That payload produces no rewrite (already `rtk`-prefixed), so the hook exits `0` and the command runs — the loop terminates after one round trip.
 
 ### Output — no rewrite
 
-When no rewrite applies (command has no RTK equivalent, is already prefixed with `rtk`, contains unattestable constructs, heredoc, or on any error): **empty stdout** and exit code 0. The original command executes unmodified.
+When no rewrite applies (command has no RTK equivalent, is already prefixed with `rtk`, contains unattestable constructs, heredoc, or on any error): **no output** and exit code 0. The original command executes unmodified.
 
 ## Exit Code Contract
 
-`rtk hook kiro` exits with code 0 in **all** paths — including errors, invalid input, and no-match cases. The hook never blocks command execution.
+`rtk hook kiro` exits `2` only when a rewrite exists. Every other path — including all errors, invalid input, and no-match cases — exits `0`, so a broken hook never blocks the user.
 
 | Condition | Behavior |
 |-----------|----------|
-| Valid command with RTK equivalent | stdout: ask JSON, exit 0 |
+| Valid command with RTK equivalent | stderr: suggestion, exit 2 |
 | No RTK equivalent | no output, exit 0 |
 | Command already prefixed with `rtk` | no output, exit 0 |
 | Unattestable construct / heredoc | no output, exit 0 |
-| Invalid JSON input | no output, exit 0 |
+| Invalid JSON input | parse note on stderr, exit 0 |
 | Empty stdin | no output, exit 0 |
 | Stdin exceeds 1 MiB | no output, exit 0 |
 | `tool_name` is not a shell tool | no output, exit 0 |

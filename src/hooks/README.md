@@ -91,17 +91,19 @@ Rules are loaded from all Claude Code `settings.json` files (project + global, i
 | Gemini CLI (rtk hook gemini) | No (allow/deny only) | allow (limitation — no ask mode in Gemini) |
 | Copilot CLI (rtk hook copilot) | No updatedInput | deny-with-suggestion (unchanged) |
 | Codex | ask parsed but no-op | allow (limitation — fails open) |
-| Kiro (rtk hook kiro) | Yes | `permissionDecision: "ask"` — user prompted with rtk suggestion |
+| Kiro (rtk hook kiro) | No updatedInput | deny-with-suggestion (exit 2 + rtk suggestion on stderr, agent retries) |
 
 ### Implementation
 
 - `permissions.rs` — loads deny/ask/allow rules, evaluates precedence, returns `PermissionVerdict`. Hosts: `Claude`, `Cursor`, `Gemini`, `Droid`, `Kiro`
 - `rewrite_cmd.rs` — maps verdict to exit code (consumed by shell hook)
-- `hook_cmd.rs` — maps verdict to JSON `permissionDecision` field (Copilot/Gemini/Kiro); `run_kiro()` handles the Kiro PreToolUse hook protocol
+- `hook_cmd.rs` — maps verdict to JSON `permissionDecision` field (Copilot/Gemini); `run_kiro()` handles the Kiro PreToolUse hook protocol and returns the exit code (0 or `KIRO_BLOCK_EXIT`)
 
 ## Exit Code Contract
 
-Hook processors in `hook_cmd.rs` must return `Ok(())` on every path — success, no-match, parse error, and unexpected input. Returning `Err` propagates to `main()` and exits non-zero, which blocks the agent's command from executing. This violates the non-blocking guarantee documented in `hooks/README.md`.
+Hook processors in `hook_cmd.rs` must return `Ok(..)` on every path — success, no-match, parse error, and unexpected input. Returning `Err` propagates to `main()` and exits non-zero unintentionally, which blocks the agent's command from executing. This violates the non-blocking guarantee documented in `hooks/README.md`.
+
+`run_kiro()` is the one processor that blocks *deliberately*: it returns `Ok(2)` when a rewrite exists so Kiro forwards the stderr suggestion to the agent. Every failure path still returns `Ok(0)`.
 
 ## Adding New Functionality
 To add support for a new AI coding agent: (1) add the hook installation logic to `init.rs` following the existing agent patterns, (2) if the agent requires a custom hook protocol (like Gemini's `BeforeTool`), add a processor function in `hook_cmd.rs`, (3) add the agent's hook file path to `hook_check.rs` for validation, and (4) update `integrity.rs` with the expected hash for the new hook file. Test by running `rtk init` in a fresh environment and verifying the hook rewrites commands correctly in the target agent.

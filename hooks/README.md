@@ -42,7 +42,7 @@ Each agent subdirectory has its own README with hook-specific details:
 - **[`opencode/`](opencode/README.md)** — TypeScript plugin, `zx` library, `tool.execute.before` event, in-place mutation
 - **[`pi/`](pi/README.md)** — TypeScript extension, `tool_call` event, `isToolCallEventType` guard, in-place mutation, `~/.pi/agent/extensions/`
 - **[`hermes/`](hermes/README.md)** — Python plugin, `pre_tool_call` hook, in-place terminal command mutation
-- **[`kiro/`](kiro/README.md)** — Steering file + PreToolUse hook, `rtk hook kiro` binary command, ask-with-suggestion fallback
+- **[`kiro/`](kiro/README.md)** — Steering file + PreToolUse hook, `rtk hook kiro` binary command, deny-with-suggestion fallback
 
 ## Supported Agents
 
@@ -59,7 +59,7 @@ Each agent subdirectory has its own README with hook-specific details:
 | OpenCode | TypeScript plugin (`tool.execute.before`) | In-place mutation | Yes |
 | Pi | TypeScript extension (`tool_call` event) | In-place mutation | Yes |
 | Hermes | Python plugin (`pre_tool_call`) | In-place mutation | Yes |
-| Kiro IDE/CLI | Steering file + Rust binary (`rtk hook kiro`) | Ask-with-suggestion | No (ask + sugestão) |
+| Kiro IDE/CLI | Steering file + Rust binary (`rtk hook kiro`) | Deny-with-suggestion | No (agent retries) |
 
 ## JSON Formats by Agent
 
@@ -195,19 +195,15 @@ if result.returncode in {0, 3} and rewritten and rewritten != command:
 }
 ```
 
-**Output** (stdout, when rewritten — ask-with-suggestion):
+**Output** (stderr + exit 2, when rewritten — deny-with-suggestion): the hook writes no JSON. Kiro has no transparent-rewrite field, so the hook blocks the raw command and lets the agent retry:
 
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "ask",
-    "permissionDecisionReason": "RTK: considere usar `rtk git status` para economizar 60-90% de tokens"
-  }
-}
+```
+RTK: use `rtk git status` (economiza 60-90% de tokens). Reemita o comando com o prefixo `rtk`.
 ```
 
-**No rewrite** (no output, exit 0): When there is no equivalent RTK command, the hook produces no stdout and exits 0 — the original command executes unmodified.
+Kiro forwards hook stderr to the model on exit code `2`. The agent re-issues `rtk git status`, which produces no rewrite (already `rtk`-prefixed) and runs untouched — one round trip, no loop.
+
+**No rewrite** (no output, exit 0): When there is no equivalent RTK command, the hook produces no output and exits 0 — the original command executes unmodified.
 
 ## Command Rewrite Registry
 

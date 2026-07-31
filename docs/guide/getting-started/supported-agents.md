@@ -38,7 +38,7 @@ Agent runs "cargo test"
 | Pi | TypeScript extension (`tool_call` event) | Yes |
 | Hermes | Python plugin (`terminal` command mutation) | Yes |
 | Factory Droid | Shell hook (`PreToolUse`, matcher `Execute`) | Yes |
-| Kiro IDE / CLI | Steering file (prompt-level) + optional shell hook (`PreToolUse`) | No (ask-with-suggestion) |
+| Kiro IDE / CLI | Steering file (prompt-level) + optional shell hook (`PreToolUse`) | No (deny-with-suggestion, agent retries) |
 | Cline / Roo Code | Rules file (prompt-level) | N/A |
 | Windsurf | Rules file (prompt-level) | N/A |
 | Codex CLI | AGENTS.md instructions | N/A |
@@ -169,7 +169,9 @@ rtk init --agent kiro --global    # steering in ~/.kiro, hook still in this proj
 Installs a dual mechanism:
 
 1. **Steering file** (primary) — `.kiro/steering/rtk.md` (project) or `~/.kiro/steering/rtk.md` (global). Always-included prompt guidance instructing the Kiro agent to prefix shell commands with `rtk`. Works in both Kiro IDE and Kiro CLI.
-2. **PreToolUse hook** (optional reinforcement) — `.kiro/hooks/rtk-rewrite.json`, always inside the workspace. Runs `rtk hook kiro` natively. Since Kiro's hook contract does not support transparent command replacement, it returns an ask-with-suggestion (`permissionDecision: "ask"`) with the equivalent `rtk <cmd>` in the reason field.
+2. **PreToolUse hook** (optional reinforcement) — `.kiro/hooks/rtk-rewrite.json`, always inside the workspace. Runs `rtk hook kiro` natively. Since Kiro's hook contract does not support transparent command replacement, it uses **deny-with-suggestion**: the hook exits with code `2` and writes the equivalent `rtk <cmd>` to stderr. Kiro blocks the raw command and forwards that text to the agent, which re-issues the command in its `rtk` form. The retry passes through untouched (already-`rtk` commands never rewrite), so there is no loop.
+
+   `ask` is deliberately not used: approving an `ask` runs the *original* command, costing a user confirmation and saving nothing. Deny-with-suggestion routes the correction to the agent instead of the user.
 
 #### Scopes: `--global` affects the steering only
 

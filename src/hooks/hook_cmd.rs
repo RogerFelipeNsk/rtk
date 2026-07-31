@@ -664,8 +664,10 @@ fn run_droid_inner_with_rules(
 // ── Kiro IDE/CLI PreToolUse hook ───────────────────────────────
 //
 // Kiro's PreToolUse hook does NOT support transparent rewrite (no `updatedInput`
-// equivalent). The hook emits an ask-com-sugestão response: `permissionDecision:
-// "ask"` with `permissionDecisionReason` containing the suggested `rtk <cmd>`.
+// equivalent). The hook uses deny-with-suggestion instead: it exits with
+// `KIRO_BLOCK_EXIT` (2) and writes the suggested `rtk <cmd>` to stderr, which Kiro
+// forwards to the agent. The agent re-issues the command in its `rtk` form and the
+// retry passes through untouched (already-`rtk` commands never rewrite).
 // The `render_kiro_transparent` branch is kept inactive, ready for a one-line
 // switch when/if Kiro adds transparent rewrite support.
 
@@ -688,18 +690,24 @@ fn kiro_shell_command(v: &Value) -> Option<&str> {
         .filter(|c| !c.is_empty())
 }
 
-/// Orchestrate the decision for a Kiro payload: extract command, decide, render.
-fn process_kiro_payload(v: &Value) -> Option<Value> {
+/// Orchestrate the decision for a Kiro payload: extract command, decide.
+///
+/// `Some(rtk_command)` means the agent should be told to re-issue that command;
+/// `None` means step aside and let the original run untouched.
+fn process_kiro_payload(v: &Value) -> Option<String> {
     let cmd = kiro_shell_command(v)?;
-    kiro_response_from_decision(v, cmd, decide_hook_action(cmd, permissions::Host::Kiro))
+    kiro_rewrite_for_decision(cmd, decide_hook_action(cmd, permissions::Host::Kiro))
 }
 
 /// Map a `HookDecision` to the Kiro hook JSON response.
 ///
 /// - `Deny` → audit log + `None` (step aside, let Kiro handle the original).
 /// - `Defer` → `None` (no rewrite, command runs unchanged).
-/// - `AllowRewrite`/`AskRewrite` → render ask-com-sugestão response.
-fn kiro_response_from_decision(v: &Value, cmd: &str, decision: HookDecision) -> Option<Value> {
+/// - `AllowRewrite`/`AskRewrite` → the `rtk` equivalent to suggest.
+///
+/// Returns the rewritten command when the agent should be told to re-issue it,
+/// or `None` when RTK must step aside and let the original command run.
+fn kiro_rewrite_for_decision(cmd: &str, decision: HookDecision) -> Option<String> {
     let rewritten = match decision {
         HookDecision::Deny => {
             audit_log("deny", cmd, "");
@@ -710,14 +718,30 @@ fn kiro_response_from_decision(v: &Value, cmd: &str, decision: HookDecision) -> 
     };
 
     audit_log("rewrite", cmd, &rewritten);
-    Some(render_kiro_ask(v, cmd, &rewritten))
-    // Future: if kiro_supports_transparent() { render_kiro_transparent(v, &rewritten) }
+    Some(rewritten)
 }
 
-/// Render the ask-com-sugestão response for Kiro.
+/// Exit code that makes Kiro block a `PreToolUse` tool call and feed the
+/// hook's stderr back to the agent.
+const KIRO_BLOCK_EXIT: i32 = 2;
+
+/// Build the deny-with-suggestion message sent to the agent on stderr.
 ///
-/// Emits `hookSpecificOutput` with `permissionDecision: "ask"` and a reason
-/// containing the suggested `rtk` command.
+/// Kiro forwards hook stderr to the model when the hook exits with
+/// [`KIRO_BLOCK_EXIT`], so this text must read as an actionable instruction:
+/// the agent is expected to re-issue the command in its `rtk` form, which the
+/// hook then lets through untouched (already-`rtk` commands never rewrite).
+fn kiro_block_message(rewritten: &str) -> String {
+    format!("RTK: use `{rewritten}` (economiza 60-90% de tokens). Reemita o comando com o prefixo `rtk`.")
+}
+
+/// Render the ask-com-sugestão response for Kiro (INACTIVE — see `run_kiro`).
+///
+/// Retained because Kiro's `ask` path is the only one that can surface a
+/// prompt to the *user* rather than the agent. It is not on the default path:
+/// approving an `ask` runs the original command, so it costs a confirmation
+/// and saves nothing. `run_kiro` uses the deny-with-suggestion path instead.
+#[allow(dead_code)]
 fn render_kiro_ask(_v: &Value, _cmd: &str, rewritten: &str) -> Value {
     json!({
         "hookSpecificOutput": {
@@ -756,42 +780,56 @@ fn render_kiro_transparent(v: &Value, rewritten: &str) -> Value {
 
 /// Run the Kiro IDE/CLI PreToolUse hook natively.
 ///
-/// Exit 0 contract: `read_stdin_limited` returns `Err` above 1 MiB; this
-/// function converts any read error (and the empty-input case) to `Ok(())`
-/// without emitting output, ensuring the original command always executes.
-pub fn run_kiro() -> Result<()> {
+/// Returns the process exit code:
+///
+/// - `0` — step aside. The original command runs untouched. This covers every
+///   no-rewrite case *and* every failure path (oversized stdin, malformed JSON,
+///   non-shell tool, empty input), so a broken hook never blocks the user.
+/// - [`KIRO_BLOCK_EXIT`] — a rewrite exists. Kiro blocks the raw command and
+///   forwards the stderr suggestion to the agent, which re-issues it as
+///   `rtk <cmd>`. That retry is idempotent: already-`rtk` commands never
+///   rewrite, so the hook lets the second attempt through and cannot loop.
+///
+/// Deny-with-suggestion is used instead of Kiro's `ask` decision because `ask`
+/// runs the *original* command on approval — it costs a user confirmation and
+/// saves nothing, since Kiro has no transparent-rewrite field.
+pub fn run_kiro() -> Result<i32> {
     let input = match read_stdin_limited() {
         Ok(s) => s,
-        Err(_) => return Ok(()), // exit 0 contract (Req 12.3/12.4)
+        Err(_) => return Ok(0), // oversized/unreadable stdin — never block
     };
     let input = strip_leading_bom(&input).trim();
     if input.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
-            return Ok(());
+            return Ok(0);
         }
     };
 
-    if let Some(output) = process_kiro_payload(&v) {
-        let _ = writeln!(io::stdout(), "{output}");
+    match process_kiro_payload(&v) {
+        Some(rewritten) => {
+            let _ = writeln!(io::stderr(), "{}", kiro_block_message(&rewritten));
+            Ok(KIRO_BLOCK_EXIT)
+        }
+        None => Ok(0),
     }
-    Ok(())
 }
 
 /// Hermetic test path: no Kiro permission settings (empty rules → Default verdict).
+///
+/// Returns the `rtk` command the agent would be told to re-issue, or `None`
+/// when RTK steps aside.
 #[cfg(test)]
-#[allow(dead_code)] // used by task 3.2 tests
 fn run_kiro_inner(input: &str) -> Option<String> {
     run_kiro_inner_with_rules(input, &[], &[], &[])
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // used by task 3.2 tests
 fn run_kiro_inner_with_rules(
     input: &str,
     deny_rules: &[String],
@@ -801,7 +839,7 @@ fn run_kiro_inner_with_rules(
     let v: Value = serde_json::from_str(input).ok()?;
     let cmd = kiro_shell_command(&v)?;
     let verdict = permissions::check_command_with_rules(cmd, deny_rules, ask_rules, allow_rules);
-    kiro_response_from_decision(&v, cmd, decide_from_verdict(cmd, verdict)).map(|o| o.to_string())
+    kiro_rewrite_for_decision(cmd, decide_from_verdict(cmd, verdict))
 }
 
 #[cfg(test)]
@@ -1960,46 +1998,22 @@ mod tests {
         assert_eq!(kiro_shell_command(&v), None);
     }
 
-    // --- Decision: rewritable → ask + suggestion ---
+    // --- Decision: rewritable → deny-with-suggestion ---
 
     #[test]
-    fn test_kiro_rewritable_command_produces_ask() {
+    fn test_kiro_rewritable_command_suggests_rtk() {
         let input = kiro_input("executeBash", "git status");
-        let out = run_kiro_inner(&input).expect("rewrite expected");
-        let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
-            v.pointer("/hookSpecificOutput/permissionDecision")
-                .and_then(|c| c.as_str()),
-            Some("ask")
-        );
-        let reason = v
-            .pointer("/hookSpecificOutput/permissionDecisionReason")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        assert!(
-            reason.contains("rtk git status"),
-            "reason should contain the rtk command, got: `{reason}`"
+            run_kiro_inner(&input),
+            Some("rtk git status".to_string()),
+            "rewritable command must yield the rtk suggestion"
         );
     }
 
     #[test]
     fn test_kiro_rewritable_cargo_test() {
         let input = kiro_input("executeBash", "cargo test");
-        let out = run_kiro_inner(&input).expect("rewrite expected");
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            v.pointer("/hookSpecificOutput/permissionDecision")
-                .and_then(|c| c.as_str()),
-            Some("ask")
-        );
-        let reason = v
-            .pointer("/hookSpecificOutput/permissionDecisionReason")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        assert!(
-            reason.contains("rtk cargo test"),
-            "reason should contain rtk cargo test, got: `{reason}`"
-        );
+        assert_eq!(run_kiro_inner(&input), Some("rtk cargo test".to_string()));
     }
 
     // --- Decision: no equivalent → None ---
@@ -2063,11 +2077,10 @@ mod tests {
 
     #[test]
     fn test_kiro_deny_steps_aside() {
-        // A denied command must produce NO output so Kiro runs the original.
-        let v: Value = serde_json::from_str(&kiro_input("executeBash", "rm -rf /tmp/x")).unwrap();
+        // A denied command must produce NO suggestion so Kiro runs the original.
         assert!(
-            kiro_response_from_decision(&v, "rm -rf /tmp/x", HookDecision::Deny).is_none(),
-            "deny must step aside (no output)"
+            kiro_rewrite_for_decision("rm -rf /tmp/x", HookDecision::Deny).is_none(),
+            "deny must step aside (no suggestion)"
         );
     }
 
@@ -2139,61 +2152,44 @@ mod tests {
         );
     }
 
-    // --- Snapshot/format-match: output structure ---
+    // --- Deny-with-suggestion: stderr message + exit code contract ---
 
     #[test]
-    fn test_kiro_ask_output_structure() {
-        // Validates: Req 10.5, 13.7 — output matches the exact Kiro JSON format.
-        let input = kiro_input("executeBash", "git status");
-        let out = run_kiro_inner(&input).expect("rewrite expected");
-        let v: Value = serde_json::from_str(&out).unwrap();
-
-        // hookSpecificOutput must exist
-        let hso = v
-            .get("hookSpecificOutput")
-            .expect("hookSpecificOutput must be present");
-
-        // hookEventName must be "PreToolUse"
-        assert_eq!(
-            hso.get("hookEventName").and_then(|v| v.as_str()),
-            Some("PreToolUse"),
-            "hookEventName must be PreToolUse"
-        );
-
-        // permissionDecision must be "ask"
-        assert_eq!(
-            hso.get("permissionDecision").and_then(|v| v.as_str()),
-            Some("ask"),
-            "permissionDecision must be ask"
-        );
-
-        // permissionDecisionReason must contain the rtk command
-        let reason = hso
-            .get("permissionDecisionReason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+    fn test_kiro_block_message_contains_suggestion() {
+        // Validates: the stderr text fed back to the agent names the rtk command
+        // and instructs the agent to re-issue it.
+        let msg = kiro_block_message("rtk git status");
         assert!(
-            reason.contains("rtk git status"),
-            "permissionDecisionReason must contain the rtk command, got: `{reason}`"
+            msg.contains("rtk git status"),
+            "block message must contain the rtk command, got: `{msg}`"
         );
-
-        // No other top-level keys (the output is clean)
-        assert_eq!(
-            v.as_object().map(|o| o.len()),
-            Some(1),
-            "output must have exactly one top-level key (hookSpecificOutput)"
+        assert!(
+            msg.contains("Reemita"),
+            "block message must instruct the agent to re-issue the command, got: `{msg}`"
         );
     }
 
     #[test]
-    fn test_kiro_ask_output_no_updated_input() {
-        // The ask path must NOT include updatedInput (that's the transparent branch).
-        let input = kiro_input("executeBash", "git status");
-        let out = run_kiro_inner(&input).expect("rewrite expected");
-        let v: Value = serde_json::from_str(&out).unwrap();
+    fn test_kiro_block_exit_is_two() {
+        // Kiro blocks a PreToolUse call and forwards stderr to the model only
+        // on exit code 2. This contract must not drift.
+        assert_eq!(KIRO_BLOCK_EXIT, 2);
+    }
+
+    #[test]
+    fn test_kiro_already_rtk_no_loop() {
+        // Feeding the SUGGESTED command back through the hook must step aside,
+        // so the agent's retry runs untouched (no infinite block/retry loop).
+        let first = process_kiro_payload(
+            &serde_json::from_str(&kiro_input("executeBash", "git status")).unwrap(),
+        )
+        .expect("rewrite expected on the first pass");
+        assert_eq!(first, "rtk git status");
+
+        let retry: Value = serde_json::from_str(&kiro_input("executeBash", &first)).unwrap();
         assert!(
-            v.pointer("/hookSpecificOutput/updatedInput").is_none(),
-            "ask path must not include updatedInput"
+            process_kiro_payload(&retry).is_none(),
+            "re-issued `{first}` must not be blocked again"
         );
     }
 
@@ -2271,14 +2267,9 @@ mod tests {
     fn test_kiro_compound_command_rewrite() {
         let input = kiro_input("executeBash", "git status && cargo test");
         let out = run_kiro_inner(&input).expect("rewrite expected for compound");
-        let v: Value = serde_json::from_str(&out).unwrap();
-        let reason = v
-            .pointer("/hookSpecificOutput/permissionDecisionReason")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
         assert!(
-            reason.contains("rtk git status") && reason.contains("rtk cargo test"),
-            "compound rewrite should prefix each segment, got: `{reason}`"
+            out.contains("rtk git status") && out.contains("rtk cargo test"),
+            "compound rewrite should prefix each segment, got: `{out}`"
         );
     }
 
@@ -2288,31 +2279,23 @@ mod tests {
     fn test_kiro_env_prefix_preserved() {
         let input = kiro_input("executeBash", "RUST_LOG=debug cargo test");
         let out = run_kiro_inner(&input).expect("rewrite expected");
-        let v: Value = serde_json::from_str(&out).unwrap();
-        let reason = v
-            .pointer("/hookSpecificOutput/permissionDecisionReason")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
         assert!(
-            reason.contains("RUST_LOG=debug") && reason.contains("rtk cargo test"),
-            "env prefix must be preserved, got: `{reason}`"
+            out.contains("RUST_LOG=debug") && out.contains("rtk cargo test"),
+            "env prefix must be preserved, got: `{out}`"
         );
     }
 
     // --- With rules ---
 
     #[test]
-    fn test_kiro_allowed_command_still_asks() {
-        // Kiro has no concept of auto-allow; even AllowRewrite emits "ask"
+    fn test_kiro_allowed_command_still_suggests() {
+        // Kiro has no transparent rewrite; even AllowRewrite yields a suggestion
+        // the agent must re-issue.
         let input = kiro_input("executeBash", "git status");
-        let out = run_kiro_inner_with_rules(&input, &[], &[], &["git status".to_string()])
-            .expect("rewrite expected");
-        let v: Value = serde_json::from_str(&out).unwrap();
-        // Both AllowRewrite and AskRewrite produce "ask" for Kiro
         assert_eq!(
-            v.pointer("/hookSpecificOutput/permissionDecision")
-                .and_then(|c| c.as_str()),
-            Some("ask")
+            run_kiro_inner_with_rules(&input, &[], &[], &["git status".to_string()]),
+            Some("rtk git status".to_string()),
+            "AllowRewrite must still produce the suggestion"
         );
     }
 
@@ -2613,11 +2596,16 @@ mod tests {
                 obj.insert("session_id".to_string(), Value::String("test-session".to_string()));
 
                 let v = Value::Object(obj);
-                // Must never panic — result is either Some(valid JSON) or None.
+                // Must never panic — result is either Some(rtk suggestion) or None.
                 let result = process_kiro_payload(&v);
-                if let Some(output) = result {
-                    // If we get output, it must be valid JSON with hookSpecificOutput
-                    prop_assert!(output.get("hookSpecificOutput").is_some());
+                if let Some(suggestion) = result {
+                    // A suggestion is always a non-empty rtk-bearing command.
+                    prop_assert!(!suggestion.is_empty());
+                    prop_assert!(
+                        suggestion.contains("rtk "),
+                        "suggestion must carry the rtk prefix, got: `{}`",
+                        suggestion
+                    );
                 }
             }
         }
@@ -2641,17 +2629,19 @@ mod tests {
                 // Must never panic.
                 let result = process_kiro_payload(&payload);
 
-                // If there is output, it must have the correct structure.
-                if let Some(output) = result {
-                    prop_assert!(output.get("hookSpecificOutput").is_some());
-                    let hso = output.get("hookSpecificOutput").unwrap();
-                    prop_assert_eq!(
-                        hso.get("permissionDecision").and_then(|v| v.as_str()),
-                        Some("ask")
+                // If there is a suggestion, it must be a usable rtk command and
+                // must differ from the original (otherwise the agent would loop).
+                if let Some(suggestion) = result {
+                    prop_assert!(!suggestion.is_empty());
+                    prop_assert!(
+                        suggestion.contains("rtk "),
+                        "suggestion must carry the rtk prefix, got: `{}`",
+                        suggestion
                     );
-                    prop_assert_eq!(
-                        hso.get("hookEventName").and_then(|v| v.as_str()),
-                        Some("PreToolUse")
+                    prop_assert_ne!(
+                        suggestion.as_str(),
+                        command.as_str(),
+                        "suggestion must differ from the original command"
                     );
                 }
                 // None is also valid — means no rewrite (Defer/Deny/no registry match).
@@ -2879,35 +2869,22 @@ mod tests {
                     cmd_with_env
                 );
 
-                let output = result.unwrap();
-                let reason = output
-                    .pointer("/hookSpecificOutput/permissionDecisionReason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let suggestion = result.unwrap();
 
-                // The reason must contain the env prefix preserved
+                // The suggestion must preserve the env prefix and insert `rtk` after it:
+                // `ENV=val rtk <base_cmd>`
                 let env_prefix = format!("{}={}", env_key, env_val);
                 prop_assert!(
-                    reason.contains(&env_prefix),
-                    "Reason must contain env prefix '{}', got: `{}`",
-                    env_prefix, reason
+                    suggestion.contains(&env_prefix),
+                    "Suggestion must contain env prefix '{}', got: `{}`",
+                    env_prefix, suggestion
                 );
 
-                // The reason must contain `rtk` after the env prefix (inside the suggested command)
-                // The suggested rewrite format is: `ENV=val rtk <base_cmd>`
                 let expected_rewrite_prefix = format!("{} rtk", env_prefix);
                 prop_assert!(
-                    reason.contains(&expected_rewrite_prefix),
-                    "Reason must contain '{}' (env prefix followed by rtk), got: `{}`",
-                    expected_rewrite_prefix, reason
-                );
-
-                // The permissionDecision must be "ask"
-                prop_assert_eq!(
-                    output.pointer("/hookSpecificOutput/permissionDecision")
-                        .and_then(|v| v.as_str()),
-                    Some("ask"),
-                    "permissionDecision must be 'ask'"
+                    suggestion.contains(&expected_rewrite_prefix),
+                    "Suggestion must contain '{}' (env prefix followed by rtk), got: `{}`",
+                    expected_rewrite_prefix, suggestion
                 );
             }
         }
@@ -2991,24 +2968,11 @@ mod tests {
                     (None, None) => {
                         // Both agree: no rewrite. Property holds.
                     }
-                    (Some(ref_rewritten), Some(kiro_output)) => {
-                        // Both agree there's a rewrite.
-                        // Extract the rewritten command from the Kiro output's
-                        // permissionDecisionReason: format is
-                        // "RTK: considere usar `<rewritten>` para economizar 60-90% de tokens"
-                        let reason = kiro_output
-                            .pointer("/hookSpecificOutput/permissionDecisionReason")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        // Extract the command between backticks in the reason
-                        let kiro_rewritten = reason
-                            .split('`')
-                            .nth(1)
-                            .unwrap_or("");
-
+                    (Some(ref_rewritten), Some(kiro_rewritten)) => {
+                        // Both agree there's a rewrite — the Kiro handler returns the
+                        // rewritten command verbatim, so compare directly.
                         prop_assert_eq!(
-                            kiro_rewritten,
+                            kiro_rewritten.as_str(),
                             ref_rewritten.as_str(),
                             "Compound '{}': Kiro path produced '{}' but registry reference produced '{}'",
                             compound, kiro_rewritten, ref_rewritten
@@ -3027,12 +2991,12 @@ mod tests {
                             ref_rewritten, compound
                         );
                     }
-                    (None, Some(kiro_output)) => {
+                    (None, Some(kiro_rewritten)) => {
                         // Kiro says rewrite but registry doesn't — should not happen.
                         prop_assert!(
                             false,
                             "Mismatch: registry returned None but Kiro returned {:?} for compound '{}'",
-                            kiro_output, compound
+                            kiro_rewritten, compound
                         );
                     }
                 }
@@ -3050,7 +3014,8 @@ mod tests {
         // Note: background `&` followed by another command is treated as a compound
         // command operator (like `&&`, `||`, `;`) — segments are split and individually
         // rewritten. This is consistent with ALL agent handlers in the codebase. The
-        // security is preserved because Kiro always uses `permissionDecision: "ask"`.
+        // security is preserved because Kiro never runs the rewrite itself — it only
+        // suggests it, and the agent must re-issue the command explicitly.
         //
         // **Validates: Requirements 5.3, 5.4, 12.2**
 
@@ -3259,17 +3224,11 @@ mod tests {
 
                     // This payload is well under 1 MiB — process_kiro_payload must work.
                     let result = process_kiro_payload(&payload);
-                    // "git status" is rewritable → must produce Some with ask decision.
-                    prop_assert!(
-                        result.is_some(),
-                        "Below-cap payload with rewritable command must produce a result"
-                    );
-                    let output = result.unwrap();
+                    // "git status" is rewritable → must produce the rtk suggestion.
                     prop_assert_eq!(
-                        output.pointer("/hookSpecificOutput/permissionDecision")
-                            .and_then(|v| v.as_str()),
-                        Some("ask"),
-                        "Below-cap rewritable command must produce 'ask' decision"
+                        result.as_deref(),
+                        Some("rtk git status"),
+                        "Below-cap rewritable command must produce the rtk suggestion"
                     );
                 }
             }
@@ -3315,19 +3274,14 @@ mod tests {
                 // at the read_stdin_limited level, not at the processing level.
                 let result = process_kiro_payload(&payload);
                 // All base_cmd values are rewritable
-                prop_assert!(
-                    result.is_some(),
-                    "Large ({} bytes) but sub-cap payload with rewritable command '{}' \
-                     must still be processed. Size limit is only at stdin reading level.",
-                    serialized.len(), base_cmd
-                );
-
-                let output = result.unwrap();
+                let expected = format!("rtk {base_cmd}");
                 prop_assert_eq!(
-                    output.pointer("/hookSpecificOutput/permissionDecision")
-                        .and_then(|v| v.as_str()),
-                    Some("ask"),
-                    "Large sub-cap payload must produce 'ask' decision"
+                    result.as_deref(),
+                    Some(expected.as_str()),
+                    "Large ({} bytes) but sub-cap payload with rewritable command '{}' \
+                     must still yield the rtk suggestion. Size limit is only at stdin \
+                     reading level.",
+                    serialized.len(), base_cmd
                 );
             }
         }
@@ -3527,20 +3481,8 @@ mod tests {
                             cmd, reference_decision
                         );
 
-                        let output_a = kiro_result_a.as_ref().unwrap();
-
-                        // Extract the rewritten command from permissionDecisionReason
-                        let reason = output_a
-                            .pointer("/hookSpecificOutput/permissionDecisionReason")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        // The reason format is:
-                        // "RTK: considere usar `<rewritten>` para economizar 60-90% de tokens"
-                        let kiro_rewritten = reason
-                            .split('`')
-                            .nth(1)
-                            .unwrap_or("");
+                        // The handler returns the rewritten command verbatim.
+                        let kiro_rewritten = kiro_result_a.as_deref().unwrap_or("");
 
                         prop_assert_eq!(
                             kiro_rewritten,
@@ -3548,17 +3490,6 @@ mod tests {
                             "Command '{}': Kiro produced rewrite '{}' but \
                              decide_hook_action produced '{}'",
                             cmd, kiro_rewritten, rewritten
-                        );
-
-                        // Verify the permissionDecision is "ask" (current behavior)
-                        let decision_field = output_a
-                            .pointer("/hookSpecificOutput/permissionDecision")
-                            .and_then(|v| v.as_str());
-                        prop_assert_eq!(
-                            decision_field,
-                            Some("ask"),
-                            "Command '{}': permissionDecision must be 'ask', got {:?}",
-                            cmd, decision_field
                         );
                     }
                 }

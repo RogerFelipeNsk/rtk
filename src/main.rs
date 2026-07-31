@@ -2408,10 +2408,9 @@ fn run_cli() -> Result<i32> {
                 hooks::hook_cmd::run_droid()?;
                 0
             }
-            HookCommands::Kiro => {
-                hooks::hook_cmd::run_kiro()?;
-                0
-            }
+            // Kiro uses deny-with-suggestion: exit 2 blocks the raw command and
+            // forwards the stderr hint so the agent re-issues it as `rtk <cmd>`.
+            HookCommands::Kiro => hooks::hook_cmd::run_kiro()?,
             HookCommands::Check { agent: _, command } => {
                 use crate::discover::registry::rewrite_command;
                 let raw = command.join(" ");
