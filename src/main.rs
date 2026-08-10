@@ -20,6 +20,7 @@ use cmds::php::{ecs_cmd, paratest_cmd, pest_cmd, php_cmd, phpstan_cmd, phpunit_c
 use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd, uv_cmd};
 use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
+use cmds::scala::sbt_cmd;
 use cmds::system::{
     deps, env_cmd, find_cmd, format_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd, read, search,
     summary, tree, wc_cmd,
@@ -56,6 +57,8 @@ pub enum AgentTarget {
     Droid,
     /// Kiro IDE and CLI
     Kiro,
+    /// Mistral Vibe CLI
+    Vibe,
 }
 
 #[derive(Parser)]
@@ -790,6 +793,12 @@ enum Commands {
         command: GoCommands,
     },
 
+    /// SBT (Scala Build Tool) commands with compact output
+    Sbt {
+        #[command(subcommand)]
+        command: SbtCommands,
+    },
+
     /// Graphite (gt) stacked PR commands with compact output
     Gt {
         #[command(subcommand)]
@@ -863,6 +872,8 @@ enum HookCommands {
     Droid,
     /// Process Kiro IDE/CLI PreToolUse hook (reads JSON from stdin)
     Kiro,
+    /// Process Mistral Vibe CLI pre_tool hook (reads JSON from stdin)
+    Vibe,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -1252,6 +1263,31 @@ enum GoCommands {
     Other(Vec<OsString>),
 }
 
+#[derive(Debug, Subcommand)]
+enum SbtCommands {
+    /// Run tests with compact output (90% token reduction via ScalaTest filtering)
+    Test {
+        /// Additional sbt test arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Compile with compact output (errors only)
+    Compile {
+        /// Additional sbt compile arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run application with noise-stripped output
+    Run {
+        /// Additional sbt run arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Passthrough: runs any unsupported sbt subcommand directly
+    #[command(external_subcommand)]
+    Other(Vec<OsString>),
+}
+
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1540,6 +1576,8 @@ where
         hooks::init::uninstall_droid(global, ctx)
     } else if agent == Some(AgentTarget::Kiro) {
         hooks::init::uninstall_kiro(global, ctx)
+    } else if agent == Some(AgentTarget::Vibe) {
+        hooks::init::uninstall_vibe(ctx)
     } else {
         let cursor = agent == Some(AgentTarget::Cursor);
         let pi = agent == Some(AgentTarget::Pi);
@@ -1551,7 +1589,7 @@ fn run_cli() -> Result<i32> {
     // Fire-and-forget telemetry ping (1/day, non-blocking)
     core::telemetry::maybe_ping();
 
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(std::env::args_os()) {
         Ok(cli) => cli,
         Err(e) => {
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
@@ -2045,6 +2083,15 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_droid_mode(global, ctx)?;
             } else if agent == Some(AgentTarget::Kiro) {
                 hooks::init::run_kiro_mode(global, ctx)?;
+            } else if agent == Some(AgentTarget::Vibe) {
+                let patch_mode = if auto_patch {
+                    hooks::init::PatchMode::Auto
+                } else if no_patch {
+                    hooks::init::PatchMode::Skip
+                } else {
+                    hooks::init::PatchMode::Ask
+                };
+                hooks::init::run_vibe_mode(global, hook_only, patch_mode, ctx)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -2366,6 +2413,13 @@ fn run_cli() -> Result<i32> {
             GoCommands::Other(args) => go_cmd::run_other(&args, cli.verbose)?,
         },
 
+        Commands::Sbt { command } => match command {
+            SbtCommands::Test { args } => sbt_cmd::run_test(&args, cli.verbose)?,
+            SbtCommands::Compile { args } => sbt_cmd::run_compile(&args, cli.verbose)?,
+            SbtCommands::Run { args } => sbt_cmd::run_run(&args, cli.verbose)?,
+            SbtCommands::Other(args) => sbt_cmd::run_other(&args, cli.verbose)?,
+        },
+
         Commands::Gt { command } => match command {
             GtCommands::Log { args } => gt_cmd::run_log(&args, cli.verbose)?,
             GtCommands::Submit { args } => gt_cmd::run_submit(&args, cli.verbose)?,
@@ -2411,6 +2465,10 @@ fn run_cli() -> Result<i32> {
             // Kiro uses deny-with-suggestion: exit 2 blocks the raw command and
             // forwards the stderr hint so the agent re-issues it as `rtk <cmd>`.
             HookCommands::Kiro => hooks::hook_cmd::run_kiro()?,
+            HookCommands::Vibe => {
+                hooks::hook_cmd::run_vibe()?;
+                0
+            }
             HookCommands::Check { agent: _, command } => {
                 use crate::discover::registry::rewrite_command;
                 let raw = command.join(" ");
@@ -2737,6 +2795,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Pip { .. }
             | Commands::Uv { .. }
             | Commands::Go { .. }
+            | Commands::Sbt { .. }
             | Commands::GolangciLint { .. }
             | Commands::Gt { .. }
     )
@@ -3116,6 +3175,7 @@ mod tests {
             "golangci-lint",
             "gradlew",
             "mvn",
+            "sbt",
             "php",
             "phpunit",
             "phpstan",

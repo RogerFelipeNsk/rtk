@@ -14,6 +14,8 @@ pub const CLAUDE_HOOK_COMMAND: &str = "rtk hook claude";
 pub const CURSOR_HOOK_COMMAND: &str = "rtk hook cursor";
 /// Native Rust hook command for Factory Droid.
 pub const DROID_HOOK_COMMAND: &str = "rtk hook droid";
+/// Native Rust hook command for Mistral Vibe.
+pub const VIBE_HOOK_COMMAND: &str = "rtk hook vibe";
 
 pub const CONFIG_DIR: &str = ".config";
 pub const OPENCODE_SUBDIR: &str = "opencode";
@@ -83,3 +85,10 @@ pub const KIRO_HOOK_COMMAND: &str = "rtk hook kiro";
 /// but the hook file `matcher` field accepts the canonical snake_case form.
 #[allow(dead_code)]
 pub const KIRO_SHELL_MATCHER: &str = "execute_bash";
+
+pub const VIBE_DIR: &str = ".vibe";
+pub const VIBE_HOOKS_FILE: &str = "hooks.toml";
+pub const VIBE_PROMPTS_SUBDIR: &str = "prompts";
+pub const VIBE_PROMPT_FILE: &str = "rtk.md";
+pub const VIBE_HOOK_NAME: &str = "rtk-rewrite";
+pub const VIBE_BASH_MATCH: &str = "bash";

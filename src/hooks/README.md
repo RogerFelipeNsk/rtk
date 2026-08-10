@@ -6,7 +6,7 @@
 
 The **lifecycle management** layer for LLM agent hooks: install, uninstall, verify integrity, audit usage, and manage trust. This component creates and maintains the hook artifacts that live in `hooks/` (root), but does **not** execute rewrite logic itself — that lives in `discover/registry`.
 
-Owns: `rtk init` installation flows (6 agents via `AgentTarget` enum + 3 special modes: Gemini, Codex, OpenCode), SHA-256 integrity verification, hook version checking, audit log analysis, `rtk rewrite` CLI entry point, and TOML filter trust management.
+Owns: `rtk init` installation flows (12 agents via `AgentTarget` enum, including Kiro and Mistral Vibe, + 3 special modes: Gemini, Codex, OpenCode), SHA-256 integrity verification, hook version checking, audit log analysis, `rtk rewrite` CLI entry point, and TOML filter trust management.
 
 Does **not** own: the deployed hook scripts themselves (that's `hooks/`), the rewrite pattern registry (that's `discover/`), or command filtering (that's `cmds/`).
 
@@ -92,10 +92,11 @@ Rules are loaded from all Claude Code `settings.json` files (project + global, i
 | Copilot CLI (rtk hook copilot) | No updatedInput | deny-with-suggestion (unchanged) |
 | Codex | ask parsed but no-op | allow (limitation — fails open) |
 | Kiro (rtk hook kiro) | No updatedInput | deny-with-suggestion (exit 2 + rtk suggestion on stderr, agent retries) |
+| Mistral Vibe (rtk hook vibe) | No native ask surface | passthrough — Vibe's own approval prompt fires on the rewritten command |
 
 ### Implementation
 
-- `permissions.rs` — loads deny/ask/allow rules, evaluates precedence, returns `PermissionVerdict`. Hosts: `Claude`, `Cursor`, `Gemini`, `Droid`, `Kiro`
+- `permissions.rs` — loads deny/ask/allow rules, evaluates precedence, returns `PermissionVerdict`. Hosts: `Claude`, `Cursor`, `Gemini`, `Droid`, `Kiro`, `Vibe`
 - `rewrite_cmd.rs` — maps verdict to exit code (consumed by shell hook)
 - `hook_cmd.rs` — maps verdict to JSON `permissionDecision` field (Copilot/Gemini); `run_kiro()` handles the Kiro PreToolUse hook protocol and returns the exit code (0 or `KIRO_BLOCK_EXIT`)
 
@@ -106,4 +107,4 @@ Hook processors in `hook_cmd.rs` must return `Ok(..)` on every path — success,
 `run_kiro()` is the one processor that blocks *deliberately*: it returns `Ok(2)` when a rewrite exists so Kiro forwards the stderr suggestion to the agent. Every failure path still returns `Ok(0)`.
 
 ## Adding New Functionality
-To add support for a new AI coding agent: (1) add the hook installation logic to `init.rs` following the existing agent patterns, (2) if the agent requires a custom hook protocol (like Gemini's `BeforeTool`), add a processor function in `hook_cmd.rs`, (3) add the agent's hook file path to `hook_check.rs` for validation, and (4) update `integrity.rs` with the expected hash for the new hook file. Test by running `rtk init` in a fresh environment and verifying the hook rewrites commands correctly in the target agent.
+To add support for a new AI coding agent: (1) add the hook installation logic to `init.rs` following the existing agent patterns, (2) if the agent requires a custom hook protocol (like Gemini's `BeforeTool` or Vibe's `pre_tool`), add a processor function in `hook_cmd.rs` and a matching `HookCommands::<Agent>` variant + `AgentTarget::<Agent>` enum entry in `main.rs`, (3) if the agent has installable permission surfaces (denylist / allowlist), wire them into `permissions.rs::check_command_for` via a new `Host::<Agent>` variant, and (4) update `integrity.rs` with the expected hash for the new hook file. Note that `hook_check.rs::maybe_warn()` only checks the Claude Code hook — other agents don't have an outdated-hook warning path. Test by running `rtk init` in a fresh environment and verifying the hook rewrites commands correctly in the target agent.
