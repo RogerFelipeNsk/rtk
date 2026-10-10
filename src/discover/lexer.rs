@@ -283,12 +283,28 @@ fn tokenize_inner(input: &str, newline_mode: NewlineMode) -> Vec<ParsedToken> {
             }
             ';' => {
                 flush_arg(&mut tokens, &mut current, current_start);
+                let start = byte_pos;
+                let mut val = String::from(";");
+                byte_pos += char_len;
+                // `;;`, `;&` and `;;&` are single `case` terminators. Split
+                // apart, the second half reads as an empty command, and the
+                // rewrite emits `; ;` or `; &` in its place — a syntax error,
+                // or a background job where a fall-through was written.
+                if chars.peek() == Some(&';') {
+                    chars.next();
+                    byte_pos += 1;
+                    val.push(';');
+                }
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    byte_pos += 1;
+                    val.push('&');
+                }
                 tokens.push(ParsedToken {
                     kind: TokenKind::Operator,
-                    value: ";".into(),
-                    offset: byte_pos,
+                    value: val,
+                    offset: start,
                 });
-                byte_pos += char_len;
                 current_start = byte_pos;
             }
             '&' => {
@@ -541,12 +557,12 @@ pub(crate) fn redirect_has_file_target(tokens: &[ParsedToken], i: usize) -> bool
 ///
 /// | | here (permission gate) | [`split_on_operators`] (analytics) | `rewrite_compound` (rewrite) |
 /// |---|---|---|---|
-/// | `&&` / `\|\|` / `;` | splits | splits | splits |
+/// | `&&` / `\|\|` / `;` / `;;` / `;&` / `;;&` | splits | splits | splits |
 /// | `\|` | always splits | stops at first `\|` | pipeline handled specially |
 /// | background `&` | splits (Shellism boundary) | does not split | splits |
 /// | `( ... )` grouping | splits (Shellism boundary) | does not split | does not split standalone |
 /// | trailing redirect | truncates the segment | kept | kept (rewritten output preserves it) |
-/// | leading redirect | stepped over, command kept | kept | kept |
+/// | leading redirect | stepped over with its attached operand, rest kept | kept | kept |
 /// | lone `\r` (no following `\n`) | splits | does not split | does not split |
 ///
 /// Like [`split_on_operators`] but also breaks on newline, background `&`,
@@ -585,14 +601,13 @@ pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
             seg_has_text = false;
         } else if tok.kind == TokenKind::Redirect {
             if !seg_has_text {
-                // A redirect may precede the command it applies to, and that
-                // command still has to reach the deny rules, so step over the
-                // redirect instead of truncating the segment at it.
-                //
-                // The operand runs to the first gap or boundary. `>$HOME/x` is
-                // several tokens but one word, and a boundary ends the operand
-                // even with no gap — in `>a|rm -rf /` the `|` starts the next
-                // command rather than continuing the filename.
+                // A redirect before the command word is stepped over instead of
+                // truncating the segment at it, together with the operand
+                // attached to the operator: the tokens that follow it with no
+                // gap, up to a boundary. `>$HOME/x` is several tokens but one
+                // word, and in `>a|rm -rf /` the `|` starts the next command
+                // rather than continuing the filename. A token after a gap
+                // belongs to the segment.
                 let mut end = tok.offset + tok.value.len();
                 let mut next = i + 1;
                 while let Some(part) = tokens.get(next) {
@@ -630,7 +645,8 @@ pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
     results
 }
 
-/// Split a shell command on operators (`&&`, `||`, `;`) and optionally pipes
+/// Split a shell command on operators (`&&`, `||`, `;`, and the `case`
+/// terminators `;;`, `;&`, `;;&`) and optionally pipes
 /// (`|`), quote-aware. `stop_at_pipe: true` returns only segments before the
 /// first `|` (rewrite's left-side-only case); `false` splits through pipes
 /// too (permission checking, every segment validated).
