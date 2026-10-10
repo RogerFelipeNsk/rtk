@@ -1,5 +1,18 @@
 # CI/CD Flows
 
+## Manual releases in forks
+
+Run `release.yml` from a branch containing the workflow fixes and pass an existing
+tag in the `tag` input. Manual builds default to `build_from_tag: true` and check
+out that tag, so the release assets match its source even when the workflow runs
+from a newer branch. Reusable calls
+from `cd.yml` default to `build_from_tag: false` and build the caller's commit
+because a pre-release tag may not exist yet (including manual CD dispatches).
+
+Forks publish with `GITHUB_TOKEN` (`contents: write`); GitHub App credentials are
+only required in `rtk-ai/rtk`, where the App token triggers downstream workflows.
+Discord notifications and Homebrew/winget updates only run in `rtk-ai/rtk`.
+
 ## PR Quality Gates (ci.yml)
 
 Trigger: pull_request to develop or master
